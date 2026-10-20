@@ -190,7 +190,8 @@ class MpsFreePublish(WxGather):
                 from core.wx.model.weread_mp import MpsWereadMP
                 wmp = MpsWereadMP()
                 wmp._load_weread_auth()
-                if wmp._weread_cookies:
+                from core.wx.model.history_first import history_attempted
+                if wmp._weread_cookies and not history_attempted.get():
                     print_info("所有 MP 后台端点均受限，检测到已配置微信读书 Cookie，自动切换至 weread_mp 通道...")
                     wmp.get_Articles(
                         faker_id=faker_id,

@@ -25,7 +25,7 @@ class WereadConfigAPITest(unittest.TestCase):
 
         asyncio.run(save_weread_cookie(request, current_user={"id": "test"}))
 
-        saved = save.call_args.args[0]
+        saved = save.call_args.args[0]["accounts"][0]
         self.assertEqual(saved["vid"], "123")
         self.assertEqual(saved["ticket"], "ticket-value")
 
@@ -80,7 +80,7 @@ class WereadConfigAPITest(unittest.TestCase):
 
         asyncio.run(save_weread_cookie(request, current_user={"id": "test"}))
 
-        saved = save.call_args.args[0]
+        saved = save.call_args.args[0]["accounts"][0]
         self.assertEqual(saved["cookie"], "wr_vid=123; wr_skey=skey")
         self.assertEqual(saved["ticket"], "new-ticket")
 
@@ -113,6 +113,8 @@ class WereadConfigAPITest(unittest.TestCase):
         from core.wx.model.weread_mp import WereadMPAPIError
 
         collector = collector_class.return_value
+        collector.history_source = "chapters"
+        collector.history_warning = ""
         collector._get_mp_articles_page.side_effect = WereadMPAPIError(
             -2041,
             "ticket expired",
@@ -131,6 +133,8 @@ class WereadConfigAPITest(unittest.TestCase):
     @patch("core.wx.model.weread.MpsWeread")
     def test_manual_note_collect_preserves_normalized_publish_time(self, collector_class, add_article):
         collector = collector_class.return_value
+        collector.history_source = "chapters"
+        collector.history_warning = ""
         collector._weread_cookies = "wr_vid=123; wr_skey=skey"
         collector._weread_ticket = "ticket-value"
 
@@ -146,7 +150,7 @@ class WereadConfigAPITest(unittest.TestCase):
             })
 
         collector.get_Articles.side_effect = collect
-        request = WereadCollectRequest(mp_id="MP_WXS_1", mp_name="Feed")
+        request = WereadCollectRequest(mp_id="WEREAD_123", mp_name="Feed")
 
         response = asyncio.run(
             collect_weread_notes(request, current_user={"id": "test"})
@@ -155,6 +159,52 @@ class WereadConfigAPITest(unittest.TestCase):
         self.assertEqual(response["data"]["collected"], 1)
         saved = add_article.call_args.args[0]
         self.assertEqual(saved["publish_time"], 1778580002)
+
+    @patch("apis.weread._save_weread_data")
+    @patch("apis.weread._load_weread_data")
+    def test_cookie_update_drops_stale_token_but_name_update_preserves_it(self, load, save):
+        for cookie, expected in ((None, "mobile-token"), ("wr_vid=123; wr_skey=new", None)):
+            with self.subTest(cookie=cookie):
+                load.return_value = {"accounts": [{
+                    "cookie": "wr_vid=123; wr_skey=old", "vid": "123",
+                    "access_token": "mobile-token",
+                }]}
+                asyncio.run(save_weread_cookie(
+                    WereadCookieRequest(cookie=cookie, name="new name"),
+                    current_user={"id": "test"},
+                ))
+                account = save.call_args.args[0]["accounts"][0]
+                self.assertEqual(account.get("access_token"), expected)
+
+    @patch("core.wx.model.weread_mp.MpsWereadMP")
+    def test_mp_connection_checks_history_over_http(self, collector_class):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from apis.weread import router, get_current_user_or_ak
+        from core.wx.model.weread_mp import WereadMPAPIError
+
+        app = FastAPI()
+        app.include_router(router)
+        app.dependency_overrides[get_current_user_or_ak] = lambda: {"id": "test"}
+        collector = collector_class.return_value
+        collector.history_source = "chapters"
+        collector.history_warning = ""
+        collector._get_mp_articles_page.return_value = {
+            "data": [{
+                "reviewId": "MP_WXS_1_article", "title": "历史文章",
+                "createTime": 1778580002,
+            }],
+            "hasMore": 0,
+        }
+        with TestClient(app) as client:
+            result = client.post("/weread/mp/test", json={"mp_id": "MP_WXS_1"}).json()
+            self.assertEqual(result["data"]["article_count"], 1)
+            self.assertEqual(result["data"]["latest_title"], "历史文章")
+            collector._get_mp_cover.assert_not_called()
+            collector._get_mp_articles_page.side_effect = WereadMPAPIError(-2041, "session inactive")
+            result = client.post("/weread/mp/test", json={"mp_id": "MP_WXS_1"}).json()
+            self.assertEqual(result["code"], 400)
+            self.assertEqual(result["data"]["code"], -2041)
 
 
 if __name__ == "__main__":

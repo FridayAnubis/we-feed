@@ -109,6 +109,9 @@ class WereadMpRequestTest(unittest.TestCase):
         collector.user_agent = "test-agent"
         collector.proxy_enabled = False
         collector.http_proxy_url = ""
+        collector._get_mp_cover = Mock(side_effect=WereadMPAPIError("empty_cover", "test"))
+        collector._get_weread_client().prepare = Mock()
+        collector._get_original_article = Mock(return_value={})
         return collector
 
     def make_collector_with_vid(self):
@@ -162,8 +165,8 @@ class WereadMpRequestTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("跳过", detail)
 
-    @patch("requests.get")
-    def test_article_list_request_uses_official_endpoint_and_ticket(self, get):
+    @patch("requests.Session.get")
+    def test_article_list_request_uses_mobile_endpoint_and_credentials(self, get):
         response = Mock(status_code=200)
         response.json.return_value = {"reviews": []}
         get.return_value = response
@@ -171,16 +174,19 @@ class WereadMpRequestTest(unittest.TestCase):
 
         payload = collector._get_mp_articles_page("MP_WXS_1", offset=20)
 
-        self.assertEqual(payload, {"reviews": []})
+        self.assertEqual(payload["reviews"], [])
         _, kwargs = get.call_args
-        self.assertEqual(get.call_args.args[0], "https://weread.qq.com/web/mp/articles")
+        self.assertEqual(get.call_args.args[0], "https://i.weread.qq.com/mp/chapters")
         self.assertEqual(
             kwargs["params"],
-            {"bookId": "MP_WXS_1", "offset": 20},
+            {"bookId": "MP_WXS_1", "offset": 20, "count": 20, "pf": "android"},
         )
-        self.assertEqual(kwargs["headers"]["x-wr-ticket"], "ticket-value")
+        self.assertEqual(kwargs["headers"]["vid"], "1")
+        self.assertEqual(kwargs["headers"]["accessToken"], "skey")
+        self.assertEqual(kwargs["headers"]["skey"], "skey")
+        self.assertNotIn("x-wr-ticket", kwargs["headers"])
 
-    @patch("requests.get")
+    @patch("requests.Session.get")
     def test_article_list_allows_missing_ticket(self, get):
         response = Mock(status_code=200)
         response.json.return_value = {"reviews": []}
@@ -190,7 +196,7 @@ class WereadMpRequestTest(unittest.TestCase):
 
         payload = collector._get_mp_articles_page("MP_WXS_1", offset=0)
 
-        self.assertEqual(payload, {"reviews": []})
+        self.assertEqual(payload["reviews"], [])
         self.assertNotIn("x-wr-ticket", get.call_args.kwargs["headers"])
 
     @patch("requests.get")
@@ -233,6 +239,11 @@ class WereadMpCollectorTest(unittest.TestCase):
         collector._get_feed_update_time = Mock(return_value=0)
         collector._get_content_interval = Mock(return_value=0)
         collector._get_page_interval = Mock(return_value=0)
+        collector._get_catchup_page_limit = Mock(side_effect=lambda requested: requested)
+        collector._app_json = Mock(side_effect=WereadMPAPIError("unavailable", "test"))
+        collector._get_original_article = Mock(return_value={"publish_time": 1778580002})
+        collector.ensure_mp_on_shelf = Mock(return_value=(True, "已在书架"))
+        collector._is_article_gathered = Mock(return_value=False)
         return collector
 
     @patch("core.wx.base.RSS.clear_cache")
@@ -308,6 +319,7 @@ class WereadMpCollectorTest(unittest.TestCase):
         collector._get_mp_articles_page = Mock(
             side_effect=WereadMPAPIError(-2041, "blocked", retriable=False)
         )
+        collector._get_original_article.side_effect = lambda *args, **kwargs: __import__("driver.wxarticle", fromlist=["Web"]).Web.get_article_content(args[0])
         collector._get_mp_cover = Mock(return_value={
             "reviewId": "MP_WXS_1_latest",
             "title": "Latest",
@@ -333,6 +345,7 @@ class WereadMpCollectorTest(unittest.TestCase):
     @patch("driver.wxarticle.Web.get_article_content", return_value={"publish_time": 0})
     def test_cover_missing_publish_time_does_not_save(self, _fetch_article):
         collector = self.make_collector()
+        collector._get_original_article.side_effect = lambda *args, **kwargs: __import__("driver.wxarticle", fromlist=["Web"]).Web.get_article_content(args[0])
         collector._get_mp_cover = Mock(return_value={
             "reviewId": "MP_WXS_1_latest", "title": "Latest",
         })
@@ -351,7 +364,12 @@ class WereadMpCollectorTest(unittest.TestCase):
         collector._get_mp_articles_page = Mock(side_effect=[
             {
                 "reviews": [
-                    {"subReviews": [{} for _ in range(20)]},
+                    {"subReviews": [
+                        {"review": {
+                            "reviewId": f"MP_WXS_1_article-{i}",
+                            "createTime": 1778580002,
+                        }} for i in range(20)
+                    ]},
                 ],
             },
             {"reviews": []},

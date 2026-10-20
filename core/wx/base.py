@@ -99,6 +99,9 @@ class WxGather:
         else:
             from core.wx.model.api import MpsApi
             wx=MpsApi()
+        if type in ("web", "api", "app", "free_publish", "auto", "playwright") and cfg.get("weread.history_first", True):
+            from core.wx.model.history_first import MpsHistoryFirst
+            return MpsHistoryFirst(wx)
         return wx
     def __init__(self,is_add:bool=False):
         self.articles=[]

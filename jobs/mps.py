@@ -231,7 +231,7 @@ def add_job(feeds:list[Feed]=None,task:MessageTask=None,isTest=False):
     # 微信读书模式：在「执行 / 定时任务」真正同步文章前，若 Cookie 过期则自动
     # 请宿主机刷新代理去刷新（容器不跑浏览器，见 scripts/host_weread_refresh_agent.py）。
     # 这样用户无需手动敲命令——点执行或定时触发时即自动保活 Cookie。
-    if not isTest and (cfg.get("gather.model") or "web") == "weread_mp":
+    if not isTest and not cfg.get("weread.history_first", True) and (cfg.get("gather.model") or "web") == "weread_mp":
         try:
             from core.weread_cookie_refresh import request_host_refresh
             res = request_host_refresh()

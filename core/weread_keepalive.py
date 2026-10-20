@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 WeFeed 微信读书 Cookie 自动保活服务
-容器原生运行：通过 Playwright 无头 Chromium 访问微信读书书架，监听并捕获更新的登录态 Cookie，写回 wx.lic。
+默认使用移动端同步与按需令牌续期；关闭 history_first 后沿用 Playwright Cookie 保活。
 无需宿主机外部脚本与 crontab，全平台（Linux/Docker/macOS/Windows）自包含。
 """
 
@@ -192,6 +192,32 @@ def run_keepalive(lic_path: str = None) -> bool:
     weread_data = lic.get("weread_data", {})
     target_url = weread_data.get("cookie_refresh_url") or TARGET_URL
     accounts = weread_data.get("accounts")
+
+    from core.config import cfg
+    if cfg.get("weread.history_first", True):
+        from core.weread_client import WereadClient, WereadAPIError, persist_account
+        candidates = accounts if isinstance(accounts, list) else [weread_data]
+        managed_cookie = cfg.get("weread.cookie", "")
+        if managed_cookie:
+            candidates = [{"cookie": managed_cookie, "vid": cfg.get("weread.vid", "")}]
+        proxy = cfg.get("proxy.http_url", "") if cfg.get("proxy.enabled", False) else ""
+        successful = 0
+        for account in candidates:
+            if not account.get("cookie") and not account.get("access_token"):
+                continue
+            client = WereadClient(
+                [account], proxies={"http": proxy, "https": proxy} if proxy else None,
+                on_refresh=None if managed_cookie else lambda old, new: persist_account(old, new, lic_path=lic_path),
+            )
+            try:
+                client.json("/shelf/sync", {"synckey": 0}, prepare=True)
+                successful += 1
+            except WereadAPIError as exc:
+                log(f"移动端保活未完成，错误码 {exc.code}")
+            finally:
+                client.close()
+        log(f"移动端保活完成，成功 {successful} 个账号")
+        return successful > 0
 
     success_count = 0
 

@@ -436,6 +436,8 @@ async def update_mps(
             "time_span":time_span,
             "list":wx.articles,
             "total":len(wx.articles),
+            "source":getattr(wx, "history_source", ""),
+            "warning":getattr(wx, "history_warning", ""),
             "mps":mp
         })
     except Exception as e:

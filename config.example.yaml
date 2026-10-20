@@ -187,6 +187,8 @@ wechat:
 
 # 微信读书配置
 weread:
+  # 配置微信读书账号后，默认先尝试移动端历史工作流，失败再使用 gather.model
+  history_first: ${WEREAD_HISTORY_FIRST:-true}
   #微信读书 Cookie (从浏览器 weread.qq.com 请求中获取)
   #需要包含: wr_vid, wr_skey, wr_gid, wr_fp 等
   cookie: "${WEREAD_COOKIE:-}"
@@ -194,7 +196,7 @@ weread:
   ticket: "${WEREAD_TICKET:-}"
   #用户vid (从 wr_vid Cookie 中提取)
   vid: "${WEREAD_VID:-}"
-  #故障补抓时最多扫描的文章列表页数
+  #首次历史抓取和增量补抓最多扫描的页数
   mp_max_pages: ${WEREAD_MP_MAX_PAGES:-20}
   #列表翻页与单篇正文请求的最小间隔（秒）
   page_interval: ${WEREAD_PAGE_INTERVAL:-1}

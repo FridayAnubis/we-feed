@@ -233,6 +233,11 @@ async def save_weread_cookie(
             matched = acc
             break
     if matched is not None:
+        # 只改显示信息时保留扫码令牌；替换 Cookie 时不能混用旧令牌。
+        if cookie_str == matched.get("cookie"):
+            for key in ("access_token", "refresh_token", "skey", "device_id"):
+                if key in matched:
+                    new_entry[key] = matched[key]
         # 保留用户改过的 name（未显式填写时不清空）
         new_entry["name"] = name_str or matched.get("name", "")
         if ticket_str is None:
@@ -302,7 +307,7 @@ async def test_weread_mp_connection(
     """Use an existing MP feed to validate the configured WeRead credentials."""
     from core.db import DB
     from core.models.feed import Feed
-    from core.wx.model.weread_mp import MpsWereadMP, WereadMPAPIError
+    from core.wx.model.weread_mp import MpsWereadMP, WereadMPAPIError, parse_mp_articles
 
     mp_id = (req.mp_id or "").strip()
     if not mp_id:
@@ -318,10 +323,9 @@ async def test_weread_mp_connection(
     wx = MpsWereadMP()
     wx._load_weread_auth()
     try:
-        # 新版微信读书已废弃 /web/mp/articles，用 /api/mp/cover 验证凭据与公众号
-        cover = wx._get_mp_cover(mp_id)
-        review_id = cover.get("reviewId", "")
-        article_count = 1 if review_id else 0
+        # 验证实际历史接口；cover 成功不能证明历史文章可用。
+        payload = wx._get_mp_articles_page(mp_id)
+        articles, _ = parse_mp_articles(payload)
     except WereadMPAPIError as exc:
         return error_response(400, str(exc), {
             "code": exc.code,
@@ -330,9 +334,11 @@ async def test_weread_mp_connection(
 
     return success_response({
         "mp_id": mp_id,
-        "mp_name": cover.get("name", ""),
-        "latest_title": cover.get("title", ""),
-        "article_count": article_count,
+        "mp_name": payload.get("name", ""),
+        "latest_title": articles[0]["title"] if articles else "",
+        "article_count": len(articles),
+        "source": getattr(wx, "history_source", "chapters"),
+        "warning": getattr(wx, "history_warning", ""),
     }, "公众号采集凭据有效")
 
 
@@ -499,6 +505,8 @@ async def collect_weread_notes(
     return success_response({
         "collected": len(articles),
         "articles": articles[:20],  # 只返回前20条
+        "source": getattr(wx, "history_source", mode_name),
+        "warning": getattr(wx, "history_warning", ""),
     }, f"采集完成，共 {len(articles)} 条{mode_name}")
 
 
