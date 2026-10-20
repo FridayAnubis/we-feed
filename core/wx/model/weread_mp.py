@@ -13,6 +13,8 @@ from core.wx.model.weread import MpsWeread
 
 
 WEREAD_WEB_BASE = "https://weread.qq.com"
+WEREAD_APP_BASE = "https://i.weread.qq.com"
+MP_PAGE_SIZE = 20
 
 def clean_article_title(raw_title: str, max_length: int = 120) -> str:
     """清洗文章标题，防止短图文将整段正文当作标题"""
@@ -81,7 +83,7 @@ def _raise_response_error(payload: dict):
         code = 0
     if code == 0:
         return
-    message = payload.get("errMsg") or payload.get("errmsg") or str(code)
+    message = payload.get("errMsg") or payload.get("errmsg") or payload.get("errlog") or str(code)
     raise WereadMPAPIError(
         code,
         message,
@@ -94,11 +96,15 @@ def parse_mp_articles(payload: dict):
         raise WereadMPAPIError("invalid_response", "response is not an object")
     _raise_response_error(payload)
 
-    groups = payload.get("reviews", []) or []
+    if "reviews" not in payload:
+        raise WereadMPAPIError("invalid_response", "article list has no reviews")
+    groups = payload.get("reviews") or []
     articles = []
     for group in groups:
         group_time = group.get("createTime", 0)
-        for sub_review in group.get("subReviews", []) or []:
+        # App 接口直接返回 reviews[].review，兼容旧 Web 接口的分组结构。
+        reviews = group.get("subReviews") if "subReviews" in group else [group]
+        for sub_review in reviews or []:
             review = sub_review.get("review") or {}
             mp_info = review.get("mpInfo") or {}
             review_id = review.get("reviewId") or sub_review.get("reviewId")
@@ -167,14 +173,12 @@ class MpsWereadMP(MpsWeread):
         return self._weread_headers(include_ticket=include_ticket)
 
     def _get_mp_articles_page(self, book_id: str, offset=0):
-        # /web/mp/articles 曾在部分旧 Cookie 上返回 -2041，当时据此回退到 cover 方案；
-        # 实测该列表接口可用，是增量补抓的主路径。失败时由 get_Articles 回退 cover。
-        # 内部走 _weread_http_get，带多账号配额 failover。
+        # 与 App 一致的历史文章接口；/api/mp/cover 只提供最新一篇。
         try:
             response = self._weread_http_get(
-                f"{WEREAD_WEB_BASE}/web/mp/articles",
-                params={"bookId": book_id, "offset": offset},
-                include_ticket=True,
+                f"{WEREAD_APP_BASE}/book/articles",
+                params={"bookId": book_id, "offset": offset, "count": MP_PAGE_SIZE, "synckey": 0},
+                app_api=True,
             )
         except Exception as exc:
             from core.wx.model.weread_mp import WereadMPAPIError
@@ -356,7 +360,7 @@ class MpsWereadMP(MpsWeread):
         """增量补抓：翻页扫描文章列表，采集所有尚未入库的文章。
 
         停止条件（满足其一即停止翻页）：
-        - 遇到已入库的文章（``_is_article_gathered``，以 articles 表为已采记录的唯一权威）
+        - 完成请求的页数后遇到已入库文章（显式多页请求仍继续读取历史）
         - 列表翻完（空页）或达到 ``weread.mp_max_pages`` 页数上限
 
         注意：不以 ``Feed.update_time`` 作为停止边界。旧版 cover 兜底模式会把
@@ -370,7 +374,7 @@ class MpsWereadMP(MpsWeread):
         """
         start_page = max(int(start_page or 0), 0)
         end_page = max(int(MaxPage or 1), start_page + 1)
-        offset = start_page
+        offset = start_page * MP_PAGE_SIZE
         latest_publish_time = 0
         content_failures = []
         previous_update_time = self._get_feed_update_time(Mps_id)
@@ -425,9 +429,9 @@ class MpsWereadMP(MpsWeread):
             if group_count == 0:
                 reached_gathered = True
                 break
-            # WeRead defines offset in top-level review groups, not subReviews.
+            # offset 按顶层 reviews 条数递增，不能按分组内文章数量递增。
             offset += group_count
-            if previous_update_time and reached_gathered:
+            if previous_update_time and reached_gathered and page >= end_page - 1:
                 break
 
         if content_failures:
@@ -442,7 +446,7 @@ class MpsWereadMP(MpsWeread):
             )
 
         print_info(f"[{Mps_title}] 增量补抓完成: 新增 {new_count} 篇")
-        return latest_publish_time or previous_update_time
+        return max(latest_publish_time, previous_update_time)
 
     def get_Articles(
         self,
@@ -459,7 +463,7 @@ class MpsWereadMP(MpsWeread):
     ):
         """Collect one existing WeChat feed without changing its RSS identity.
 
-        主路径走 ``/web/mp/articles`` 列表接口做增量补抓：从最新一页开始翻页，
+        主路径走 ``i.weread.qq.com/book/articles`` 列表接口做增量补抓：从最新一页开始翻页，
         采集所有尚未入库的文章，遇到已入库文章即停止（上一轮到这一轮之间漏采的
         文章会一并补齐）。列表接口不可用（如 -2012 登录超时 / -2041 等）时回退到
         ``/api/mp/cover`` 只取最新一篇的兜底逻辑，保证采集不中断。

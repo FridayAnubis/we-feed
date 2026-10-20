@@ -56,14 +56,13 @@ class MpsWeread(WxGather):
         super().__init__(is_add=is_add)
         self._weread_cookies: str = ""
         self._weread_ticket: str = ""
+        self._weread_access_token: str = ""
         self._weread_vid: str = ""
         self._weread_name: str = ""
         # 多账号：wx.lic 的 weread_data.accounts 数组，或包装单账号旧格式
         self._weread_accounts: list = []
         self._current_account_idx: int = 0
-        # 最近一次失败是否**所有账号配额都耗尽**。用于把「配额耗尽」和
-        # 「登录态失效」在报错里区分开 —— 两者在 API 层同码（-2012）。
-        self._weread_quota_exhausted: bool = False
+        self._weread_last_error: str = ""
 
     def _load_weread_auth(self):
         """加载微信读书的 Cookie
@@ -101,8 +100,13 @@ class MpsWeread(WxGather):
 
         # 选择当前激活账号：优先 env 变量覆盖，否则用第一个
         self._current_account_idx = 0
-        self._weread_cookies = app_cfg.get("weread.cookie", "") or (
+        config_cookie = app_cfg.get("weread.cookie", "")
+        self._weread_cookies = config_cookie or (
             self._weread_accounts[0].get("cookie", "") if self._weread_accounts else ""
+        )
+        self._weread_access_token = (
+            self._weread_accounts[0].get("access_token", "")
+            if self._weread_accounts and not config_cookie else ""
         )
         self._weread_ticket = app_cfg.get("weread.ticket", "") or (
             self._weread_accounts[0].get("ticket", "") if self._weread_accounts else ""
@@ -128,6 +132,7 @@ class MpsWeread(WxGather):
         )
         acc = self._weread_accounts[self._current_account_idx]
         self._weread_cookies = acc.get("cookie", "")
+        self._weread_access_token = acc.get("access_token", "")
         self._weread_ticket = acc.get("ticket", "")
         self._weread_vid = acc.get("vid", "")
         self._weread_name = acc.get("name", "")
@@ -148,26 +153,32 @@ class MpsWeread(WxGather):
             "Referer": "https://weread.qq.com/",
         }
         if include_ticket and self._weread_ticket:
-            # 新版微信读书已弃用 x-wr-ticket，仅需有效 Cookie 即可拉取文章列表；
-            # 保留旧逻辑以便兼容旧版微信读书。无 ticket 时不拦截请求。
+            # 保留旧 Web 调用的 ticket 支持；App 历史接口使用独立请求头。
             headers["x-wr-ticket"] = self._weread_ticket
         return headers
 
-    def _weread_http_get(self, url: str, params: dict = None, include_ticket=False, timeout=(10, 30)):
-        """GET 请求微信读书 API，带多账号配额 failover。
+    def _weread_app_headers(self) -> dict:
+        """App 历史接口改用 accessToken/vid 请求头"""
+        cookies = dict(
+            part.strip().split("=", 1)
+            for part in self._weread_cookies.split(";") if "=" in part
+        )
+        return {
+            "accessToken": cookies.get("accessToken") or getattr(self, "_weread_access_token", "") or cookies.get("wr_skey", ""),
+            "vid": cookies.get("wr_vid") or self._weread_vid,
+            "User-Agent": "WeRead/9.3.1 WRBrand/vivo Dalvik/2.1.0 (Linux; U; Android 14; V2171A Build/UP1A.231005.007)",
+            "Accept": "application/json",
+        }
 
-        检测到配额耗尽（HTTP 499 / errcode -2014 / -2041 / -2012）时，
-        自动切换到 ``wx.lic`` 中下一个账号并重试。
-
-        返回值：``requests.Response`` 对象（像 ``requests.get`` 一样使用）。
-        """
+    def _weread_http_get(self, url: str, params: dict = None, include_ticket=False, timeout=(10, 30), app_api=False):
+        """请求微信读书 API；认证或访问受限时尝试下一个账号"""
         import requests
         from core.wx.model.weread_mp import WereadMPAPIError
 
-        self._weread_quota_exhausted = False
+        self._weread_last_error = ""
         tried_accounts = set()
         while True:
-            headers = self._weread_headers(include_ticket=include_ticket)
+            headers = self._weread_app_headers() if app_api else self._weread_headers(include_ticket=include_ticket)
 
             try:
                 resp = requests.get(
@@ -179,44 +190,37 @@ class MpsWeread(WxGather):
             except requests.RequestException as exc:
                 raise WereadMPAPIError("network_error", str(exc)) from exc
 
-            # 检查响应中的配额耗尽信号
-            is_quota_exhausted = False
-            if resp.status_code == 499:
-                is_quota_exhausted = True
-            elif resp.status_code == 200:
+            code = resp.status_code
+            message = f"HTTP {resp.status_code}"
+            account_failed = resp.status_code in (401, 403, 499)
+            if resp.status_code == 200:
                 try:
                     payload = resp.json()
-                    code = payload.get("errcode", payload.get("errCode", 0))
-                    if code in (-2014, -2041, -2012):
-                        is_quota_exhausted = True
-                except (ValueError, AttributeError):
+                    code = int(payload.get("errcode", payload.get("errCode", 0)) or 0)
+                    message = payload.get("errmsg") or payload.get("errMsg") or payload.get("errlog") or str(code)
+                    account_failed = code in (-2014, -2041, -2012, -2010)
+                except (ValueError, TypeError, AttributeError):
                     pass
 
-            if is_quota_exhausted:
-                if self._current_account_idx not in tried_accounts:
-                    tried_accounts.add(self._current_account_idx)
+            if account_failed:
+                tried_accounts.add(self._current_account_idx)
                 idx_before = self._current_account_idx
                 if self._switch_weread_account() and self._current_account_idx not in tried_accounts:
                     logger.info(
-                        f"配额耗尽（当前账号 {idx_before}），"
-                        f"切换到账号 {self._current_account_idx}（{self._weread_name or '未命名'}）重试"
+                        f"账号 {idx_before} 请求失败（{code}: {message}），"
+                        f"切换到账号 {self._current_account_idx} 重试"
                     )
                     continue
-                # 所有账号都试过了
-                self._weread_quota_exhausted = True
-                raise WereadMPAPIError(
-                    499 if resp.status_code == 499 else (code if 'code' in locals() else -2041),
-                    f"所有账号配额均已耗尽（{len(tried_accounts)} 个）",
-                    retriable=False,
-                )
+                self._weread_last_error = f"{message}（已尝试 {len(tried_accounts)} 个账号，错误码 {code}）"
+                raise WereadMPAPIError(code, self._weread_last_error, retriable=False)
 
-            self._weread_quota_exhausted = False
+            self._weread_last_error = ""
             return resp
 
     def _weread_get(self, url: str, params: dict = None) -> Optional[dict]:
         """带微信读书 Cookie 的 GET 请求（web 域，浏览器完整请求头）
 
-        内部走 ``_weread_http_get``，带多账号配额 failover。
+        内部走 ``_weread_http_get``，请求受限时尝试其他账号。
         """
         try:
             resp = self._weread_http_get(url, params=params, timeout=15)
@@ -643,12 +647,6 @@ class MpsWeread(WxGather):
         测试微信读书认证是否有效
         返回: {"ok": bool, "name": str, "vid": str, "book_count": int, "error": str}
 
-        ⚠️ 不要把这里的所有失败都写成「Cookie 可能已过期」（2026-10-06 修正）：
-        实测配额耗尽时 `/web/shelf/sync` 会返回 `-2012 登录态失效`，与真正的
-        登录过期**完全同码**。旧实现一律报「Cookie 可能已过期」，导致用户
-        反复重扫 Cookie —— 而重扫根本没用（配额按 `wr_vid` 计，与 Cookie 有效期
-        无关；实测同一 Cookie 换出口 IP 结果一致）。现在按「是否所有账号都耗尽」
-        分开报。
         """
         self.get_token()  # 加载基础配置
         self._load_weread_auth()
@@ -664,16 +662,9 @@ class MpsWeread(WxGather):
 
         books = self._get_shelf_books()
         if books is None:
-            n = len(self._weread_accounts)
-            if self._weread_quota_exhausted:
-                if n > 1:
-                    hint = (f"（已尝试全部 {n} 个账号）"
-                            f"；可稍后重试或用「扫码授权」再绑一个微信号分流配额")
-                else:
-                    hint = ("；这是**配额耗尽**不是 Cookie 过期 —— 配额按微信账号计算，"
-                            "重扫同一个微信号无效，请稍后重试或添加第二个账号")
+            if self._weread_last_error:
                 return {"ok": False, "name": "", "vid": self._weread_vid, "book_count": 0,
-                        "error": f"微信读书访问配额已耗尽{hint}"}
+                        "error": self._weread_last_error}
             return {"ok": False, "name": "", "vid": self._weread_vid, "book_count": 0,
                     "error": "微信读书 API 请求失败（网络或 Cookie 失效），请重新扫码授权"}
 

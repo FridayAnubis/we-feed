@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, call
 
 from core.wx.model.weread_mp import (
     MpsWereadMP,
@@ -62,6 +62,22 @@ class WereadMpParsingTest(unittest.TestCase):
             },
         )
 
+    def test_parse_app_articles_preserves_id_url_and_publish_time(self):
+        articles, count = parse_mp_articles({"reviews": [{"review": {
+            "reviewId": "MP_WXS_1_article", "createTime": 1792303800,
+            "mpInfo": {"title": "History", "originalId": "abc~def", "time": 1792303881},
+        }}]})
+
+        self.assertEqual(count, 1)
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0]["id"], "MP_WXS_1_article")
+        self.assertEqual(articles[0]["link"], "https://mp.weixin.qq.com/s/abc_def")
+        self.assertEqual(articles[0]["update_time"], 1792303881)
+
+    def test_unrecognized_list_response_is_not_treated_as_empty_history(self):
+        with self.assertRaises(WereadMPAPIError):
+            parse_mp_articles({"errCode": 0})
+
     def test_parse_mp_articles_classifies_rate_limit(self):
         with self.assertRaises(WereadMPAPIError) as caught:
             parse_mp_articles({"errCode": -2041, "errMsg": "request blocked"})
@@ -105,6 +121,8 @@ class WereadMpRequestTest(unittest.TestCase):
     def make_collector(self):
         collector = object.__new__(MpsWereadMP)
         collector._weread_cookies = "wr_vid=1; wr_skey=skey"
+        collector._weread_accounts = []
+        collector._current_account_idx = 0
         collector._weread_ticket = "ticket-value"
         collector.user_agent = "test-agent"
         collector.proxy_enabled = False
@@ -163,7 +181,7 @@ class WereadMpRequestTest(unittest.TestCase):
         self.assertIn("跳过", detail)
 
     @patch("requests.get")
-    def test_article_list_request_uses_official_endpoint_and_ticket(self, get):
+    def test_article_list_request_uses_app_endpoint_and_access_token(self, get):
         response = Mock(status_code=200)
         response.json.return_value = {"reviews": []}
         get.return_value = response
@@ -173,12 +191,14 @@ class WereadMpRequestTest(unittest.TestCase):
 
         self.assertEqual(payload, {"reviews": []})
         _, kwargs = get.call_args
-        self.assertEqual(get.call_args.args[0], "https://weread.qq.com/web/mp/articles")
+        self.assertEqual(get.call_args.args[0], "https://i.weread.qq.com/book/articles")
         self.assertEqual(
             kwargs["params"],
-            {"bookId": "MP_WXS_1", "offset": 20},
+            {"bookId": "MP_WXS_1", "offset": 20, "count": 20, "synckey": 0},
         )
-        self.assertEqual(kwargs["headers"]["x-wr-ticket"], "ticket-value")
+        self.assertEqual(kwargs["headers"]["accessToken"], "skey")
+        self.assertEqual(kwargs["headers"]["vid"], "1")
+        self.assertNotIn("x-wr-ticket", kwargs["headers"])
 
     @patch("requests.get")
     def test_article_list_allows_missing_ticket(self, get):
@@ -192,6 +212,78 @@ class WereadMpRequestTest(unittest.TestCase):
 
         self.assertEqual(payload, {"reviews": []})
         self.assertNotIn("x-wr-ticket", get.call_args.kwargs["headers"])
+
+    @patch("core.config.Config")
+    @patch("driver.weread_qr.os.path.exists", return_value=True)
+    def test_qr_login_keeps_access_token_separate_from_web_cookie(self, _exists, config_class):
+        from driver.weread_qr import WereadQRLogin
+        login = object.__new__(WereadQRLogin)
+        login._build_cookie_dict = Mock(return_value={"wr_vid": "1", "wr_skey": "web-cookie"})
+        login._verify_cookies = Mock(return_value=True)
+        config_class.return_value.get.return_value = {"accounts": []}
+
+        login._save_cookies_to_lic({"vid": "1", "accessToken": "original-token"})
+
+        saved = config_class.return_value.set.call_args.args[1]["accounts"][0]
+        self.assertEqual(saved["access_token"], "original-token")
+        self.assertIn("wr_skey=web-cookie", saved["cookie"])
+
+    def test_app_headers_use_original_qr_access_token(self):
+        collector = self.make_collector()
+        collector._weread_access_token = "qr-access-token"
+        self.assertEqual(collector._weread_app_headers()["accessToken"], "qr-access-token")
+        collector._weread_cookies += "; accessToken=app-token"
+        self.assertEqual(collector._weread_app_headers()["accessToken"], "app-token")
+
+    @patch("requests.get")
+    def test_auth_error_keeps_original_reason_instead_of_claiming_quota(self, get):
+        get.return_value = Mock(status_code=200)
+        get.return_value.json.return_value = {"errcode": -2012, "errmsg": "登录超时"}
+        collector = self.make_collector()
+
+        with self.assertRaises(WereadMPAPIError) as caught:
+            collector._get_mp_articles_page("MP_WXS_1")
+
+        self.assertEqual(caught.exception.code, -2012)
+        self.assertIn("登录超时", str(caught.exception))
+        self.assertNotIn("配额", str(caught.exception))
+
+    @patch("requests.get")
+    def test_failover_rebuilds_app_credentials_for_next_account(self, get):
+        rejected = Mock(status_code=401)
+        accepted = Mock(status_code=200)
+        accepted.json.return_value = {"reviews": []}
+        get.side_effect = [rejected, accepted]
+        collector = self.make_collector()
+        collector._weread_accounts = [
+            {"cookie": "wr_vid=1; wr_skey=skey"},
+            {"cookie": "wr_vid=2; wr_skey=web2", "vid": "2", "access_token": "app2"},
+        ]
+
+        self.assertEqual(collector._get_mp_articles_page("MP_WXS_1"), {"reviews": []})
+        headers = get.call_args.kwargs["headers"]
+        self.assertEqual(headers["accessToken"], "app2")
+        self.assertEqual(headers["vid"], "2")
+        self.assertEqual(get.call_count, 2)
+
+    @patch("requests.get")
+    def test_all_accounts_rejected_preserves_service_error(self, get):
+        rejected = Mock(status_code=200)
+        rejected.json.return_value = {"errcode": "-2041", "errlog": "request blocked"}
+        get.return_value = rejected
+        collector = self.make_collector()
+        collector._weread_accounts = [
+            {"cookie": "wr_vid=1; wr_skey=one", "vid": "1"},
+            {"cookie": "wr_vid=2; wr_skey=two", "vid": "2"},
+        ]
+
+        with self.assertRaises(WereadMPAPIError) as caught:
+            collector._get_mp_articles_page("MP_WXS_1")
+
+        self.assertEqual(caught.exception.code, -2041)
+        self.assertIn("request blocked", str(caught.exception))
+        self.assertIn("2 个账号", str(caught.exception))
+        self.assertEqual(get.call_count, 2)
 
     @patch("requests.get")
     def test_content_request_extracts_official_article_html(self, get):
@@ -220,6 +312,8 @@ class WereadMpCollectorTest(unittest.TestCase):
         collector.start_time = None
         collector.Gather_Content = False
         collector._weread_cookies = "wr_vid=1; wr_skey=skey"
+        collector._weread_accounts = []
+        collector._current_account_idx = 0
         collector._weread_ticket = "ticket-value"
         collector._weread_vid = "1"
         collector._weread_name = "tester"
@@ -233,6 +327,8 @@ class WereadMpCollectorTest(unittest.TestCase):
         collector._get_feed_update_time = Mock(return_value=0)
         collector._get_content_interval = Mock(return_value=0)
         collector._get_page_interval = Mock(return_value=0)
+        collector._is_article_gathered = Mock(return_value=False)
+        collector.ensure_mp_on_shelf = Mock(return_value=(True, "already on shelf"))
         return collector
 
     @patch("core.wx.base.RSS.clear_cache")
@@ -344,6 +440,60 @@ class WereadMpCollectorTest(unittest.TestCase):
             )
 
         callback.assert_not_called()
+
+    @patch("core.wx.base.RSS.clear_cache")
+    def test_app_history_pages_are_saved_without_cover_fallback(self, _clear_cache):
+        collector = self.make_collector()
+        collector._is_article_gathered = Mock(return_value=False)
+        collector.ensure_mp_on_shelf = Mock(return_value=(True, "already on shelf"))
+        def page(start, count):
+            return {"reviews": [{"review": {
+                "reviewId": f"MP_WXS_1_{i}", "createTime": 1792303881 - i,
+                "mpInfo": {"title": str(i), "originalId": str(i), "time": 1792303881 - i},
+            }} for i in range(start, start + count)]}
+        collector._get_mp_articles_page = Mock(side_effect=[page(0, 20), page(20, 3), page(23, 0)])
+        collector._get_mp_cover = Mock()
+        saved = []
+
+        collector.get_Articles(
+            Mps_id="MP_WXS_1", Mps_title="History", MaxPage=3,
+            CallBack=lambda article: saved.append(article) or True,
+        )
+
+        self.assertEqual(len(saved), 23)
+        self.assertEqual(saved[0]["publish_time"], 1792303881)
+        self.assertEqual(saved[-1]["publish_time"], 1792303859)
+        self.assertEqual(collector._get_mp_articles_page.call_args_list, [
+            call("MP_WXS_1", offset=0), call("MP_WXS_1", offset=20), call("MP_WXS_1", offset=23),
+        ])
+        collector._get_mp_cover.assert_not_called()
+
+    def test_requested_history_pages_continue_past_known_latest_article(self):
+        collector = self.make_collector()
+        collector._get_feed_update_time = Mock(return_value=1792303881)
+        collector._get_catchup_page_limit = Mock(return_value=20)
+        collector._is_article_gathered = Mock(side_effect=lambda mp, aid: aid.endswith("latest"))
+        collector._get_mp_articles_page = Mock(side_effect=[
+            {"reviews": [{"review": {"reviewId": "MP_WXS_1_latest", "mpInfo": {"time": 1792303881}}}]},
+            {"reviews": [{"review": {"reviewId": "MP_WXS_1_older", "mpInfo": {"time": 1792200000}}}]},
+        ])
+        saved = []
+
+        latest = collector._collect_via_article_list(
+            "MP_WXS_1", "MP_WXS_1", "History", False, 0, 2,
+            CallBack=lambda article: saved.append(article) or True,
+        )
+
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["publish_time"], 1792200000)
+        self.assertEqual(latest, 1792303881)
+        self.assertEqual(collector._get_mp_articles_page.call_count, 2)
+
+    def test_start_page_is_converted_to_article_offset(self):
+        collector = self.make_collector()
+        collector._get_mp_articles_page = Mock(return_value={"reviews": []})
+        collector._collect_via_article_list("MP_WXS_1", "MP_WXS_1", "History", False, 2, 3)
+        collector._get_mp_articles_page.assert_called_once_with("MP_WXS_1", offset=40)
 
     @patch("core.wx.base.RSS.clear_cache")
     def test_pagination_counts_groups_not_articles(self, _clear_cache):

@@ -127,6 +127,29 @@ class WereadConfigAPITest(unittest.TestCase):
         self.assertEqual(response["code"], 400)
         self.assertEqual(response["data"]["code"], -2041)
 
+    @patch("apis.weread._ensure_weread_mp_feed")
+    @patch("core.wx.model.weread_mp.MpsWereadMP")
+    def test_manual_mp_collect_honors_requested_history_pages(self, collector_class, _ensure_feed):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from apis.weread import router, get_current_user_or_ak
+
+        collector = collector_class.return_value
+        collector._weread_cookies = "wr_vid=123; wr_skey=skey"
+        # 不影响同步采集启动浏览器事件循环
+        collector.get_Articles.side_effect = lambda **kwargs: asyncio.run(asyncio.sleep(0))
+        app = FastAPI()
+        app.include_router(router)
+        app.dependency_overrides[get_current_user_or_ak] = lambda: {"id": "test"}
+        with TestClient(app) as client:
+            response = client.post("/weread/collect", json={
+                "mp_id": "MP_WXS_1", "max_page": 5, "gather_content": False,
+            })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["code"], 0)
+        self.assertEqual(collector.get_Articles.call_args.kwargs["MaxPage"], 5)
+
     @patch("core.db.DB.add_article", return_value=True)
     @patch("core.wx.model.weread.MpsWeread")
     def test_manual_note_collect_preserves_normalized_publish_time(self, collector_class, add_article):

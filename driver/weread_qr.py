@@ -869,6 +869,7 @@ class WereadQRLogin:
             )
             account_entry = {
                 "cookie": cookie_str,
+                "access_token": result.get("accessToken", ""),
                 "vid": str(vid),
                 "name": result.get("name", "") or "",
             }

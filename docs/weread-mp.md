@@ -1,17 +1,24 @@
 # 微信读书公众号采集
 
-当公众号后台接口不可用时，可以把采集模式切换为微信读书 Web。该模式直接请求 `weread.qq.com`，不经过第三方中转，并继续使用现有的 `MP_WXS_*` Feed ID 和 RSS 地址。
+`GATHER.MODEL=weread_mp` 使用微信读书采集公众号文章，保留现有 `MP_WXS_*` Feed ID 和 RSS 地址。
 
-## 配置
+## 历史列表和登录凭据
 
-1. 登录 `https://weread.qq.com`，打开任意公众号页面。
-2. 在浏览器开发者工具的 Network 面板找到 `/api/mp/cover` 请求（旧版 `/web/mp/articles` 已被微信读书废弃）。
-3. 从 Request Headers 复制完整 `Cookie`（新版不需要 `x-wr-ticket`）。
-4. 在管理页的“微信读书公众号采集”中保存，或设置环境变量：
+历史列表使用 `GET https://i.weread.qq.com/book/articles`，参数为 `bookId`、`count=20`、`offset`、`synckey=0`，请求头使用 `accessToken`、`vid`。这是 [zlzchat 发布包](https://github.com/565800105/zlzchat/blob/292803fce88dc4efd78f81b12b837252a9ac7d4d/website.jar) 中使用的接口（`WxReadCommon.getFeedArticle`）；与原来的 Web `/web/mp/articles` 不同。
+
+- 在“微信读书管理”扫码登录后，新保存的账号会保留原始 `accessToken`，不再仅保留 Web Cookie。
+- 已保存的旧账号仍会尝试将 Cookie 的 `wr_skey` 用作 `accessToken`；重新扫码可以保存原始令牌。
+- **Web 登录成功不代表 App 历史接口一定授权成功。** 若历史接口返回 401 或登录错误，需要该接口接受的有效 App 凭据，不能仅靠更换请求地址或重扫 Web 二维码保证恢复。
+- 如已有同一账号的 App `accessToken`，可通过现有 Cookie 输入或 `WEREAD_COOKIE` 提供：`wr_vid=<vid>; accessToken=<App令牌>`。需要 Web 书架、Cover 或正文接口时，保留同一账号原有的 Web Cookie，在其后追加 `; accessToken=<App令牌>`。
+- 不引入第三方登录服务；网页 Cookie 和 App 凭据均只请求微信读书官方域名。
+
+配置示例：
 
 ```env
 GATHER.MODEL=weread_mp
 WEREAD_COOKIE=wr_vid=...; wr_skey=...; wr_rt=...
+WEREAD_MP_MAX_PAGES=20
+WEREAD_PAGE_INTERVAL=1
 WEREAD_CONTENT_INTERVAL=2
 ```
 

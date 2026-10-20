@@ -484,7 +484,7 @@ async def collect_weread_notes(
             Mps_id=mp_id,
             Mps_title=req.mp_name or faker_id or "微信读书",
             CallBack=save_callback,
-            MaxPage=1,
+            MaxPage=max(req.max_page, 1),
             interval=3,
             Gather_Content=req.gather_content,
         )
